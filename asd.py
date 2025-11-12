@@ -36,10 +36,16 @@ def api_post(payload, need_key=False, stream=False):
     key = os.getenv("MB_AUTH_KEY", "")
     if need_key:
         if not key:
-            print("ERROR: MB_AUTH_KEY is not set — download calls require an API key.", file=sys.stderr)
+            print("ERROR: MB_AUTH_KEY not set — download calls require an API key.", file=sys.stderr)
             sys.exit(1)
-        # Some clients use 'API-KEY', others 'X-API-KEY'; MalwareBazaar accepts 'API-KEY'
+        # Send key in multiple headers to cover all API variants
         headers["API-KEY"] = key
+        headers["X-API-KEY"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    r = requests.post(API_URL, data=payload, headers=headers, timeout=60, stream=stream)
+    r.raise_for_status()
+    return r
+
 
     r = requests.post(API_URL, data=payload, headers=headers, timeout=60, stream=stream)
     r.raise_for_status()
