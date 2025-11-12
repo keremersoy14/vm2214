@@ -146,3 +146,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+curl -X POST https://mb-api.abuse.ch/api/v1/ \
+     -H "API-KEY: $MB_AUTH_KEY" \
+     -d "query=get_recent"
