@@ -1,209 +1,142 @@
 #!/usr/bin/env python3
 """
-grabber_safe.py
+grabber_api_pdf.py
+Fetch recent PDF samples from MalwareBazaar (no CLI, pure HTTP API), skip duplicates, download ZIPs.
 
-- Requires: 'bazaar' CLI available in PATH and MB_AUTH_KEY exported in the shell.
-- Usage: within your Kali VM:
-    source ~/mb_venv/bin/activate
-    export MB_AUTH_KEY="PASTE_YOUR_KEY"
-    python3 grabber_safe.py
-
-What it does:
-- Query MalwareBazaar for recent PDFs (limit set by MB_LIMIT env or default 200)
-- Skip SHAs already recorded in STATE (~/.mb_seen_pdfs.txt)
-- Download new samples with bazaar CLI
-- Move zip(s) created into OUT_DIR (~/mb_downloads)
-- Append each successful SHA to STATE
+Prereqs:
+  pip install requests
+Env:
+  export MB_AUTH_KEY="YOUR_ABUSE_CH_API_KEY"   # required for downloads
+Usage:
+  python3 grabber_api_pdf.py
 """
 
-import os
-import sys
-import json
-import shlex
-import subprocess
-import time
-import glob
-import shutil
+import os, sys, time, json, pathlib, requests
+from datetime import datetime
 
-# ------------------- Configuration -------------------
-STATE = os.path.expanduser("~/.mb_seen_pdfs.txt")
-OUT_DIR = os.path.expanduser("~/mb_downloads")
-LIMIT = int(os.getenv("MB_LIMIT", "200"))   # how many recent entries to check
-SLEEP_BETWEEN = float(os.getenv("MB_SLEEP", "0.5"))  # seconds between downloads
-# -----------------------------------------------------
+API_URL = "https://mb-api.abuse.ch/api/v1/"
+STATE = pathlib.Path("~/.mb_seen_pdfs.txt").expanduser()
+OUT_DIR = pathlib.Path("~/mb_downloads").expanduser()
+LIMIT = int(os.getenv("MB_LIMIT", "200"))  # how many recent to consider
 
-os.makedirs(OUT_DIR, exist_ok=True)
-
-def run(cmd):
-    """Run a command (using shlex.split) and return stdout, raise RuntimeError on non-zero."""
-    p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed ({cmd!r}): {p.stderr.strip()}")
-    return p.stdout
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def load_seen():
-    if not os.path.exists(STATE):
+    if not STATE.exists():
         return set()
-    with open(STATE, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+    return {line.strip() for line in STATE.read_text().splitlines() if line.strip()}
 
 def append_seen(sha):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    with open(STATE, "a") as f:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    with STATE.open("a") as f:
         f.write(sha + "\n")
 
-def find_new_zips(before_set):
-    """Return newly-created zip filenames in the current working directory compared to before_set."""
-    after = set(glob.glob("*.zip"))
-    new = after - before_set
-    return sorted(new)
+def api_post(payload, need_key=False, stream=False):
+    headers = {}
+    key = os.getenv("MB_AUTH_KEY", "")
+    if need_key:
+        if not key:
+            print("ERROR: MB_AUTH_KEY is not set — download calls require an API key.", file=sys.stderr)
+            sys.exit(1)
+        # Some clients use 'API-KEY', others 'X-API-KEY'; MalwareBazaar accepts 'API-KEY'
+        headers["API-KEY"] = key
 
-def download_sha_and_move(sha):
+    r = requests.post(API_URL, data=payload, headers=headers, timeout=60, stream=stream)
+    r.raise_for_status()
+    return r
+
+def fetch_recent_pdfs(limit=200):
     """
-    Download a SHA using bazaar CLI and move any created zip(s) to OUT_DIR.
-    Returns list of destination paths moved.
+    Use 'get_file_type' to retrieve recent entries by file type.
+    Many deployments accept 'selector=time' to bias recent.
     """
-    # record current zip files in working dir
-    before = set(glob.glob("*.zip"))
-    # run the download
-    run(f"bazaar query hash {sha} --download")
-    # small settle
-    time.sleep(0.15)
-    new_zips = find_new_zips(before)
-
-    # fallback: if no new zips in cwd, look for recently modified zip under home (best-effort)
-    if not new_zips:
-        candidates = sorted(glob.glob(os.path.expanduser("~/") + "**/*.zip", recursive=True),
-                            key=lambda p: os.path.getmtime(p), reverse=True)
-        if candidates:
-            top = candidates[0]
-            if (time.time() - os.path.getmtime(top)) < 180:
-                new_zips = [top]
-
-    moved = []
-    for z in new_zips:
-        src = z
-        # If src is absolute path from fallback, keep src; otherwise it is relative filename
-        if not os.path.isabs(src):
-            src = os.path.abspath(src)
-        dst = os.path.join(OUT_DIR, os.path.basename(src))
-        try:
-            shutil.move(src, dst)
-        except Exception:
-            # try copy+remove if move fails across filesystems
-            shutil.copy2(src, dst)
-            os.remove(src)
-        moved.append(dst)
-    return moved
-
-def clean_json_from_output(out_text):
-    """Extract the first top-level JSON object or array from text and parse it."""
-    # find first '[' or '{'
-    pos_bracket = out_text.find('[')
-    pos_brace = out_text.find('{')
-
-    if pos_bracket == -1 and pos_brace == -1:
-        raise ValueError("No JSON object or array found in CLI output")
-
-    if pos_bracket == -1:
-        start = pos_brace
-        open_ch, close_ch = '{', '}'
-    elif pos_brace == -1:
-        start = pos_bracket
-        open_ch, close_ch = '[', ']'
-    else:
-        if pos_bracket < pos_brace:
-            start = pos_bracket
-            open_ch, close_ch = '[', ']'
-        else:
-            start = pos_brace
-            open_ch, close_ch = '{', '}'
-
-    # locate the last occurrence of the matching closing character
-    end = out_text.rfind(close_ch)
-    if end == -1:
-        raise ValueError(f"No closing {close_ch} found in CLI output")
-
-    candidate = out_text[start:end + 1]
-
+    payload = {
+        "query": "get_file_type",
+        "file_type": "pdf",
+        "limit": str(limit),
+        "selector": "time",
+    }
+    r = api_post(payload)
     try:
-        return json.loads(candidate)
-    except Exception as e:
-        # helpful debug output
-        print("Failed parsing candidate JSON chunk:", e, file=sys.stderr)
-        preview = candidate[:2000].replace("\n", "\\n")
-        print("Candidate preview (first 2000 chars):", preview, file=sys.stderr)
-        raise
+        data = r.json()
+    except Exception:
+        print("Server did not return JSON; raw head:", r.text[:400], file=sys.stderr)
+        sys.exit(1)
+    entries = data.get("data", [])
+    # normalize timestamp and sort newest first
+    def ts(x):
+        # examples: '2025-11-01 06:52:29'
+        s = (x.get("first_seen") or x.get("last_seen") or "").strip()
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            return 0.0
+    entries.sort(key=ts, reverse=True)
+    return entries
+
+def download_zip_for_sha(sha):
+    """
+    Use 'get_file' to retrieve a password-protected ZIP for the sample.
+    Writes a .zip into OUT_DIR and returns the path.
+    """
+    payload = {"query": "get_file", "sha256_hash": sha}
+    r = api_post(payload, need_key=True, stream=True)
+    # If API returns JSON error, try to show it
+    ctype = r.headers.get("Content-Type", "")
+    if "application/zip" not in ctype and "application/octet-stream" not in ctype:
+        txt = r.text[:800]
+        raise RuntimeError(f"Unexpected content-type ({ctype}). Server said: {txt}")
+    # filename from header if present, else synthesize
+    fname = None
+    cd = r.headers.get("Content-Disposition", "")
+    if "filename=" in cd:
+        fname = cd.split("filename=", 1)[1].strip().strip('"')
+    if not fname:
+        fname = f"{sha}.zip"
+    out_path = OUT_DIR / fname
+    with out_path.open("wb") as f:
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
+    return out_path
 
 def main():
-    # quick environment checks
-    if "MB_AUTH_KEY" not in os.environ:
-        print("Warning: MB_AUTH_KEY not set in environment. Ensure you exported your abuse.ch API key.", file=sys.stderr)
-    try:
-        seen = load_seen()
-    except Exception as e:
-        print("Error reading state file:", e, file=sys.stderr)
-        seen = set()
+    print(f"State file: {STATE}")
+    print(f"Output dir: {OUT_DIR}")
+    seen = load_seen()
+    print(f"Loaded {len(seen)} seen SHAs.")
 
-    print(f"Loaded {len(seen)} seen SHAs from {STATE}")
+    print("Fetching recent PDF entries…")
+    items = fetch_recent_pdfs(LIMIT)
+    print(f"API returned {len(items)} items.")
 
-    # Query
-    print("Querying MalwareBazaar for recent PDF entries...")
-    try:
-        raw = run(f"bazaar query filetype pdf --limit {LIMIT} --json")
-    except RuntimeError as e:
-        print("Error running bazaar CLI:", e, file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        data = clean_json_from_output(raw)
-    except Exception as e:
-        print("Failed to parse JSON from bazaar output:", e, file=sys.stderr)
-        print("Raw output preview:", raw[:1000].replace("\n", "\\n"), file=sys.stderr)
-        sys.exit(1)
-
-    # The API may return a list (top-level array) or an object with "data": [...]
-    items = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict) and "data" in data:
-        items = data.get("data", [])
-    else:
-        print("Unexpected JSON structure from bazaar CLI; exiting.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"API returned {len(items)} items; scanning for new SHAs...")
-
-    new_shas = []
+    new = []
     for it in items:
         sha = it.get("sha256_hash") or it.get("sha256")
         if not sha:
             continue
         if sha in seen:
             continue
-        new_shas.append(sha)
+        new.append(sha)
 
-    if not new_shas:
-        print("No new PDF samples found. Exiting.")
+    if not new:
+        print("No new PDF samples found. Done.")
         return
 
-    print(f"Found {len(new_shas)} new SHAs to download (processing in API order).")
-
-    for sha in new_shas:
-        print("-> Downloading", sha)
+    print(f"Will download {len(new)} new samples (newest first).")
+    for i, sha in enumerate(new, 1):
         try:
-            moved_files = download_sha_and_move(sha)
-            if moved_files:
-                for m in moved_files:
-                    print("   moved to", m)
-            else:
-                print("   WARNING: download succeeded but no new zip detected (no file moved).")
+            print(f"[{i}/{len(new)}] downloading {sha} …")
+            path = download_zip_for_sha(sha)
+            print(f"   saved to {path}")
             append_seen(sha)
-            # mark as seen even if no zip found to avoid endless retries if MB removed it
+            time.sleep(float(os.getenv("MB_SLEEP", "0.5")))
         except Exception as e:
-            print("   Download failed for", sha, ":", e, file=sys.stderr)
-        # be gentle on API
-        time.sleep(SLEEP_BETWEEN)
+            print(f"   ERROR for {sha}: {e}", file=sys.stderr)
+
+    print("Done. Recent files:")
+    for p in sorted(OUT_DIR.glob("*.zip"), key=lambda x: x.stat().st_mtime, reverse=True)[:10]:
+        print(" -", p)
 
 if __name__ == "__main__":
     main()
