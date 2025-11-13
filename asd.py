@@ -1,37 +1,19 @@
-from malwarebazaar.api import Bazaar
-from requests.exceptions import JSONDecodeError  # from requests
+#!/usr/bin/env python3
 import os
+import zipfile
 
-bazaar = Bazaar("your_api_key_here")
+source_dir = "/path/to/zips"
+dest_dir = "/path/to/output"
+password = b"infected"
 
-hash_list_path = "/home/kali/Desktop/pdf_sha256.txt"
-download_dir   = "/home/kali/Desktop/bazaar_samples"
-os.makedirs(download_dir, exist_ok=True)
+os.makedirs(dest_dir, exist_ok=True)
 
-with open(hash_list_path, "r") as fileout:
-    for line in fileout:
-        sha256 = line.strip()
-        if not sha256:
-            continue
+for file in os.listdir(source_dir):
+    if file.lower().endswith(".zip"):
+        zip_path = os.path.join(source_dir, file)
+        print(f"Unzipping {file}...")
 
-        try:
-            response = bazaar.query_hash(sha256)
-        except JSONDecodeError:
-            print(f"[!] Non-JSON response for {sha256} (rate limit / server hiccup). Skipping.")
-            continue
-        except Exception as e:
-            print(f"[!] Error querying {sha256}: {e}")
-            continue
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(path=dest_dir, pwd=password)
 
-        if response.get("query_status") != "ok":
-            print(f"[!] {sha256} not found: {response.get('query_status')}")
-            continue
-
-        try:
-            file_content = bazaar.download_file(sha256)
-            out_path = os.path.join(download_dir, f"{sha256}.zip")
-            with open(out_path, "wb") as f:
-                f.write(file_content)
-            print(f"[+] Downloaded {sha256} -> {out_path}")
-        except Exception as e:
-            print(f"[!] Failed to download {sha256}: {e}")
+print("Done.")
