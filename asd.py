@@ -1,34 +1,37 @@
-#!/usr/bin/env python3
-
+from malwarebazaar.api import Bazaar
+from requests.exceptions import JSONDecodeError  # from requests
 import os
-import zipfile
 
-PASSWORD = b"infected"  # password must be bytes
+bazaar = Bazaar("your_api_key_here")
 
-def unzip_all_with_password(directory="."):
-    # List all files in the given directory
-    for filename in os.listdir(directory):
-        if filename.lower().endswith(".zip"):
-            zip_path = os.path.join(directory, filename)
-            extract_dir = os.path.join(directory, filename[:-4])  # remove .zip
+hash_list_path = "/home/kali/Desktop/pdf_sha256.txt"
+download_dir   = "/home/kali/Desktop/bazaar_samples"
+os.makedirs(download_dir, exist_ok=True)
 
-            print(f"[+] Processing: {zip_path}")
-            # Make the output folder if it doesn't exist
-            os.makedirs(extract_dir, exist_ok=True)
+with open(hash_list_path, "r") as fileout:
+    for line in fileout:
+        sha256 = line.strip()
+        if not sha256:
+            continue
 
-            try:
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    # set password and extract all files
-                    zf.extractall(path=extract_dir, pwd=PASSWORD)
-                print(f"    -> Extracted to: {extract_dir}")
-            except RuntimeError as e:
-                # Wrong password or encrypted method not supported
-                print(f"    [!] Failed to extract {filename}: {e}")
-            except zipfile.BadZipFile as e:
-                print(f"    [!] Bad zip file {filename}: {e}")
-            except Exception as e:
-                print(f"    [!] Unexpected error for {filename}: {e}")
+        try:
+            response = bazaar.query_hash(sha256)
+        except JSONDecodeError:
+            print(f"[!] Non-JSON response for {sha256} (rate limit / server hiccup). Skipping.")
+            continue
+        except Exception as e:
+            print(f"[!] Error querying {sha256}: {e}")
+            continue
 
-if __name__ == "__main__":
-    # current directory by default
-    unzip_all_with_password(".")
+        if response.get("query_status") != "ok":
+            print(f"[!] {sha256} not found: {response.get('query_status')}")
+            continue
+
+        try:
+            file_content = bazaar.download_file(sha256)
+            out_path = os.path.join(download_dir, f"{sha256}.zip")
+            with open(out_path, "wb") as f:
+                f.write(file_content)
+            print(f"[+] Downloaded {sha256} -> {out_path}")
+        except Exception as e:
+            print(f"[!] Failed to download {sha256}: {e}")
